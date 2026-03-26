@@ -4,7 +4,9 @@ langchain-community
 langchain-core
 langchain-text-splitters
 faiss-cpu
+python-multipart
 pypdf
-google-generativeai
+google-genai
 pydantic
 rank_bm25
+numpy

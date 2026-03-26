@@ -7,339 +7,318 @@ from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 from pydantic import BaseModel
+from collections.abc import AsyncGenerator   # ✅ Python 3.13 style
 import google.generativeai as genai
-import os, shutil, logging, asyncio, json, pickle
-from typing import List, Dict, Optional
-from rank_bm25 import BM25Okapi  
+import os, shutil, logging, asyncio, pickle
+from typing import Any
+from rank_bm25 import BM25Okapi
 import numpy as np
 
+# ──────────────────────────────────────────
+# Logging
+# ──────────────────────────────────────────
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Improved Gemini RAG Agent")
+# ──────────────────────────────────────────
+# App
+# ──────────────────────────────────────────
+app = FastAPI(title="Gemini RAG Agent – Python 3.13")
 app.add_middleware(
     CORSMiddleware, allow_origins=["*"],
     allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
 )
 
-UPLOAD_DIR = "uploads"
+UPLOAD_DIR     = "uploads"
 VECTOR_DB_PATH = "vectorstore"
-BM25_PATH = os.path.join(VECTOR_DB_PATH, "bm25.pkl")
-PARENT_CHUNKS_PATH = os.path.join(VECTOR_DB_PATH, "parent_chunks.pkl")
+BM25_PATH      = os.path.join(VECTOR_DB_PATH, "bm25.pkl")
+PARENT_PATH    = os.path.join(VECTOR_DB_PATH, "parent_chunks.pkl")
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(VECTOR_DB_PATH, exist_ok=True)
 
-GEMINI_API_KEY = "AIzaSyBLcZrR0KVR1C7MRdp-R1_mAmRZh4BoeBM"   
-if not GEMINI_API_KEY:
-    raise RuntimeError("GEMINI_API_KEY not set.")
-
+# ──────────────────────────────────────────
+# Gemini config
+# ──────────────────────────────────────────
+GEMINI_API_KEY = "AIzaSyCFft1Yvo9s2uCzwh-eutm9fje-QNaZe58"
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel("gemini-3-flash-preview")  # ✅ FIX 2: Valid model name
+GEMINI_MODEL = genai.GenerativeModel("gemini-3-flash-preview")
 
-CHAT_MEMORY: Dict[str, List[Dict[str, str]]] = {}
+# ──────────────────────────────────────────
+# ✅ FIX: AskRequest defined at top level
+#    — before any function or route uses it
+# ──────────────────────────────────────────
+class AskRequest(BaseModel):
+    query: str
 
-# -----------------------------------------------
-# Gemini Embeddings (unchanged, works well)
-# -----------------------------------------------
+# ──────────────────────────────────────────
+# In-memory stores
+# ──────────────────────────────────────────
+CHAT_MEMORY:   dict[str, list[dict[str, str]]] = {}
+parent_chunks: dict[str, str] = {}
+bm25_corpus:   list[dict]     = []
+bm25_index:    Any | None     = None
+vectorstore:   FAISS | None   = None
+
+
+# ──────────────────────────────────────────
+# Embeddings
+# ──────────────────────────────────────────
 class GeminiEmbedding(Embeddings):
-    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
         return [self.embed_query(t) for t in texts]
 
-    def embed_query(self, text: str) -> List[float]:
-        result = genai.embed_content(model="gemini-embedding-001", content=text)
+    def embed_query(self, text: str) -> list[float]:
+        result = genai.embed_content(
+            model="gemini-embedding-001",
+            content=text,
+            task_type="retrieval_document",
+        )
         return result["embedding"]
 
-embedding = GeminiEmbedding()
-
-# -----------------------------------------------
-# ✅ FIX 3: Parent-Child Chunk Store
-# Small child chunks → embedded for precision retrieval
-# Large parent chunks → fed to LLM for richer context
-# -----------------------------------------------
-parent_chunks: Dict[str, str] = {}   # child_id → parent text
-bm25_index: Optional[object] = None
-bm25_corpus: List[str] = []
-vectorstore: Optional[FAISS] = None
+embedding_fn = GeminiEmbedding()
 
 
-def save_bm25():
-    with open(BM25_PATH, "wb") as f:
-        pickle.dump((bm25_index, bm25_corpus), f)
+# ──────────────────────────────────────────
+# Persistence helpers
+# ──────────────────────────────────────────
+def _save(path: str, obj: object) -> None:
+    with open(path, "wb") as f:
+        pickle.dump(obj, f)
 
-def load_bm25():
-    global bm25_index, bm25_corpus
-    if os.path.exists(BM25_PATH):
-        with open(BM25_PATH, "rb") as f:
-            bm25_index, bm25_corpus = pickle.load(f)
+def _load(path: str) -> Any | None:
+    if os.path.exists(path):
+        with open(path, "rb") as f:
+            return pickle.load(f)
+    return None
 
-def save_parent_chunks():
-    with open(PARENT_CHUNKS_PATH, "wb") as f:
-        pickle.dump(parent_chunks, f)
+def load_all() -> None:
+    global vectorstore, bm25_index, bm25_corpus, parent_chunks
 
-def load_parent_chunks():
-    global parent_chunks
-    if os.path.exists(PARENT_CHUNKS_PATH):
-        with open(PARENT_CHUNKS_PATH, "rb") as f:
-            parent_chunks = pickle.load(f)
+    if os.path.exists(os.path.join(VECTOR_DB_PATH, "index.faiss")):
+        try:
+            vectorstore = FAISS.load_local(
+                VECTOR_DB_PATH, embedding_fn,
+                allow_dangerous_deserialization=True,
+            )
+            logger.info("FAISS loaded ✅")
+        except Exception as e:
+            logger.error(f"FAISS load failed: {e}")
 
-def load_vectorstore():
-    global vectorstore
-    index_path = os.path.join(VECTOR_DB_PATH, "index.faiss")
-    if os.path.exists(index_path):
-        vectorstore = FAISS.load_local(
-            VECTOR_DB_PATH, embedding, allow_dangerous_deserialization=True
-        )
+    data = _load(BM25_PATH)
+    if data:
+        bm25_index, bm25_corpus = data
+        logger.info("BM25 loaded ✅")
 
-load_vectorstore()
-load_bm25()
-load_parent_chunks()
+    data = _load(PARENT_PATH)
+    if data:
+        parent_chunks = data
+        logger.info(f"Parent chunks loaded: {len(parent_chunks)} ✅")
+
+load_all()
 
 
-# -----------------------------------------------
-# ✅ FIX 4: HyDE — Hypothetical Document Embeddings
-# Generate a "fake ideal answer" and embed THAT
-# instead of the raw user question. Retrieves far
-# more relevant chunks because the vector space
-# better matches answer-shaped text.
-# -----------------------------------------------
+# ──────────────────────────────────────────
+# HyDE
+# ──────────────────────────────────────────
 def generate_hypothetical_answer(query: str) -> str:
     try:
-        hyde_prompt = (
-            f"Write a concise, factual paragraph that directly answers: '{query}'. "
-            "Use specific details. This will be used for document retrieval only."
+        resp = GEMINI_MODEL.generate_content(
+            f"Write one concise factual paragraph that directly answers: '{query}'. "
+            f"Use specific details. For document retrieval only."
         )
-        resp = model.generate_content(hyde_prompt)
         return resp.text.strip()
     except Exception as e:
-        logger.warning(f"HyDE failed, falling back to raw query: {e}")
+        logger.warning(f"HyDE failed, using raw query: {e}")
         return query
 
 
-# -----------------------------------------------
-# ✅ FIX 5: Hybrid Retrieval (Dense + BM25 Sparse)
-# BM25 catches exact keyword/acronym matches that
-# semantic search misses. RRF fuses both rankings.
-# -----------------------------------------------
+# ──────────────────────────────────────────
+# Reciprocal Rank Fusion
+# ──────────────────────────────────────────
 def reciprocal_rank_fusion(
-    dense_ids: List[str],
-    sparse_ids: List[str],
-    k: int = 60
-) -> List[str]:
-    scores: Dict[str, float] = {}
+    dense_ids: list[str],
+    sparse_ids: list[str],
+    k: int = 60,
+) -> list[str]:
+    scores: dict[str, float] = {}
     for rank, doc_id in enumerate(dense_ids):
-        scores[doc_id] = scores.get(doc_id, 0) + 1 / (k + rank + 1)
+        scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (k + rank + 1)
     for rank, doc_id in enumerate(sparse_ids):
-        scores[doc_id] = scores.get(doc_id, 0) + 1 / (k + rank + 1)
-    return sorted(scores, key=scores.get, reverse=True)
+        scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (k + rank + 1)
+    return sorted(scores, key=lambda x: scores[x], reverse=True)
 
 
-def hybrid_search(query: str, top_k: int = 8) -> List[str]:
-    """Returns list of parent chunk texts ranked by RRF score."""
+# ──────────────────────────────────────────
+# Hybrid search
+# ──────────────────────────────────────────
+def hybrid_search(query: str, top_k: int = 6) -> list[str]:
     if vectorstore is None:
         return []
 
-    # 1. HyDE: embed hypothetical answer instead of raw query
-    hyde_text = generate_hypothetical_answer(query)
+    hyde_text   = generate_hypothetical_answer(query)
+    dense_docs  = vectorstore.similarity_search(hyde_text, k=top_k * 2)
+    dense_ids   = [d.metadata.get("child_id", d.page_content[:40]) for d in dense_docs]
 
-    # 2. Dense retrieval (semantic)
-    dense_results = vectorstore.similarity_search(hyde_text, k=top_k * 2)
-    dense_ids = [d.metadata.get("child_id", d.page_content[:40]) for d in dense_results]
+    sparse_ids: list[str] = []
+    if bm25_index is not None and bm25_corpus:
+        tokens      = query.lower().split()
+        bm25_scores = bm25_index.get_scores(tokens)
+        top_idx     = np.argsort(bm25_scores)[::-1][: top_k * 2]
+        sparse_ids  = [bm25_corpus[i]["id"] for i in top_idx]
 
-    # 3. Sparse retrieval (BM25 keyword)
-    sparse_ids: List[str] = []
-    if bm25_index and bm25_corpus:
-        tokenized = query.lower().split()
-        bm25_scores = bm25_index.get_scores(tokenized)
-        top_indices = np.argsort(bm25_scores)[::-1][:top_k * 2]
-        sparse_ids = [bm25_corpus[i]["id"] for i in top_indices]
-
-    # 4. Fuse rankings
     fused_ids = reciprocal_rank_fusion(dense_ids, sparse_ids)[:top_k]
 
-    # 5. ✅ FIX 6: Return PARENT chunks (not child chunks)
-    # Child was retrieved for precision; parent gives LLM full context
-    seen, contexts = set(), []
+    seen: set[str] = set()
+    contexts: list[str] = []
     for doc_id in fused_ids:
         text = parent_chunks.get(doc_id, "")
         if text and text not in seen:
             seen.add(text)
             contexts.append(text)
-
-    return contexts[:top_k]
-
-
-# -----------------------------------------------
-# Request model
-# -----------------------------------------------
-class AskRequest(BaseModel):
-    query: str
+    return contexts
 
 
-# -----------------------------------------------
-# ✅ FIX 7: Structured prompt with citation guidance
-# Explicit instructions reduce hallucination and
-# force grounding. Few-shot style "RULES" help
-# the model follow the no-hallucination constraint.
-# -----------------------------------------------
-SYSTEM_PROMPT = """You are a precise document assistant. Your job is to answer questions
-based ONLY on the provided document context.
+# ──────────────────────────────────────────
+# Prompt builder
+# ──────────────────────────────────────────
+SYSTEM_PROMPT = (
+    "You are a precise document assistant. Answer ONLY from the CONTEXT below.\n\n"
+    "RULES:\n"
+    "1. Never use outside knowledge.\n"
+    "2. If context is insufficient say: "
+    "'The document does not contain enough information to answer this.'\n"
+    "3. Quote dates, numbers, and names directly from context.\n"
+    "4. No padding or filler sentences.\n"
+    "5. For summaries, cover every key point in the context.\n"
+)
 
-STRICT RULES:
-1. Answer ONLY from the CONTEXT section below. Never use outside knowledge.
-2. If context is insufficient, say exactly: "I can not answer this question based on the provided context."
-3. For numerical data, dates, or names: quote directly from context.
-4. Keep answers focused — no padding or generic introductions.
-5. If asked to summarize, cover all key points found in the context.
-"""
-
-def build_prompt(context_chunks: List[str], history: str, query: str) -> str:
+def build_prompt(chunks: list[str], history: str, query: str) -> str:
     context = "\n\n---\n\n".join(
-        f"[Chunk {i+1}]\n{chunk}" for i, chunk in enumerate(context_chunks)
+        f"[Chunk {i+1}]\n{c}" for i, c in enumerate(chunks)
     )
-    return f"""{SYSTEM_PROMPT}
-
-CONTEXT (from uploaded document):
-{context}
-
-CONVERSATION HISTORY (last 5 turns):
-{history}
-
-USER QUESTION:
-{query}
-
-ANSWER:"""
+    return (
+        f"{SYSTEM_PROMPT}\n"
+        f"CONTEXT:\n{context}\n\n"
+        f"CONVERSATION HISTORY:\n{history}\n\n"
+        f"USER QUESTION:\n{query}\n\n"
+        f"ANSWER:"
+    )
 
 
-# -----------------------------------------------
-# Streaming generator (unchanged logic, cleaner)
-# -----------------------------------------------
-async def stream_gemini_response(
+# ──────────────────────────────────────────
+# Streaming generator
+# ──────────────────────────────────────────
+async def stream_response(
     prompt: str,
-    memory_list: List[Dict],
+    memory: list[dict[str, str]],
     query: str,
-):
-    full_response = []
+) -> AsyncGenerator[bytes, None]:
+    tokens: list[str] = []
     try:
-        response = model.generate_content(prompt, stream=True)
+        response = GEMINI_MODEL.generate_content(prompt, stream=True)
         for chunk in response:
             if chunk.text:
-                full_response.append(chunk.text)
-                yield chunk.text.encode("utf-8")
+                tokens.append(chunk.text)
+                yield chunk.text.encode()
                 await asyncio.sleep(0)
-        if full_response:
-            memory_list.append({
-                "user": query,
-                "assistant": "".join(full_response)
-            })
+        if tokens:
+            memory.append({"user": query, "assistant": "".join(tokens)})
     except Exception as e:
-        yield f"\n[Error: {e}]".encode("utf-8")
+        err = f"\n[Stream error: {e}]"
+        logger.error(err)
+        yield err.encode()
 
 
-# -----------------------------------------------
+# ──────────────────────────────────────────
 # Routes
-# -----------------------------------------------
+# ──────────────────────────────────────────
 @app.get("/")
-def home():
-    return {"message": "Improved Gemini RAG Agent"}
+def home() -> dict:
+    return {"status": "ok", "message": "Gemini RAG Agent running"}
 
 
 @app.post("/upload")
-async def upload_pdf(file: UploadFile = File(...)):
+async def upload_pdf(file: UploadFile = File(...)) -> dict:
     global vectorstore, bm25_index, bm25_corpus
 
     if not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="PDFs only.")
+        raise HTTPException(400, "Only PDF files are accepted.")
 
-    file_path = os.path.join(UPLOAD_DIR, file.filename)
-    with open(file_path, "wb") as f:
+    path = os.path.join(UPLOAD_DIR, file.filename)
+    with open(path, "wb") as f:
         shutil.copyfileobj(file.file, f)
 
     try:
-        loader = PyPDFLoader(file_path)
-        docs = loader.load()
+        docs = PyPDFLoader(path).load()
 
-        # ✅ FIX 3a: Parent splitter — larger, for LLM context
         parent_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000, chunk_overlap=150
+            chunk_size=1000, chunk_overlap=150,
         )
-        # ✅ FIX 3b: Child splitter — smaller, for precise embedding
         child_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=200, chunk_overlap=30
+            chunk_size=200, chunk_overlap=30,
         )
 
-        parent_docs = parent_splitter.split_documents(docs)
-        child_langchain_docs = []
-        new_bm25_items = []
+        parent_docs                    = parent_splitter.split_documents(docs)
+        child_lc_docs:  list[Document] = []
+        new_bm25_items: list[dict]     = []
 
-        for p_idx, parent_doc in enumerate(parent_docs):
-            # Stable parent ID based on file + chunk position
-            p_id = f"{file.filename}::parent::{p_idx}"
-            parent_chunks[p_id] = parent_doc.page_content
+        for p_idx, p_doc in enumerate(parent_docs):
+            p_id                = f"{file.filename}::p::{p_idx}"
+            parent_chunks[p_id] = p_doc.page_content
 
-            # Derive child chunks from this parent
-            children = child_splitter.split_text(parent_doc.page_content)
-            for c_idx, child_text in enumerate(children):
-                c_id = f"{p_id}::child::{c_idx}"
-                # Each child points back to its parent
-                child_langchain_docs.append(
-                    Document(
-                        page_content=child_text,
-                        metadata={**parent_doc.metadata, "child_id": p_id}
-                    )
-                )
+            for c_idx, child_text in enumerate(
+                child_splitter.split_text(p_doc.page_content)
+            ):
+                child_lc_docs.append(Document(
+                    page_content=child_text,
+                    metadata={**p_doc.metadata, "child_id": p_id},
+                ))
                 new_bm25_items.append({"id": p_id, "text": child_text})
 
-        # Update FAISS
         if vectorstore is None:
-            vectorstore = FAISS.from_documents(child_langchain_docs, embedding)
+            vectorstore = FAISS.from_documents(child_lc_docs, embedding_fn)
         else:
-            vectorstore.add_documents(child_langchain_docs)
+            vectorstore.add_documents(child_lc_docs)
         vectorstore.save_local(VECTOR_DB_PATH)
 
-        # Update BM25 index (rebuild from scratch to stay consistent)
         bm25_corpus.extend(new_bm25_items)
-        tokenized_corpus = [item["text"].lower().split() for item in bm25_corpus]
-        bm25_index = BM25Okapi(tokenized_corpus)
-        save_bm25()
-        save_parent_chunks()
+        bm25_index = BM25Okapi([item["text"].lower().split() for item in bm25_corpus])
+        _save(BM25_PATH,   (bm25_index, bm25_corpus))
+        _save(PARENT_PATH, parent_chunks)
 
-        logger.info(f"Indexed {len(parent_docs)} parent / {len(child_langchain_docs)} child chunks")
+        logger.info(f"{file.filename}: {len(parent_docs)} parents, {len(child_lc_docs)} children")
         return {
-            "message": "PDF uploaded and indexed ✅",
+            "message":       "Uploaded and indexed ✅",
+            "filename":      file.filename,
             "parent_chunks": len(parent_docs),
-            "child_chunks": len(child_langchain_docs),
-            "filename": file.filename
+            "child_chunks":  len(child_lc_docs),
         }
 
     except Exception as e:
-        logger.error(f"Upload error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception("Upload failed")
+        raise HTTPException(500, str(e))
 
 
 @app.post("/ask")
-async def ask(request: Request, body: AskRequest):
-    session_id = request.client.host if request.client else "default"
-    if session_id not in CHAT_MEMORY:
-        CHAT_MEMORY[session_id] = []
+async def ask(request: Request, body: AskRequest) -> StreamingResponse:
+    sid = request.client.host if request.client else "default"
+    CHAT_MEMORY.setdefault(sid, [])
 
     if vectorstore is None:
-        raise HTTPException(status_code=400, detail="Upload a PDF first.")
+        raise HTTPException(400, "No documents indexed yet — upload a PDF first.")
 
-    query = body.query
-    context_chunks = hybrid_search(query, top_k=6)
-
-    if not context_chunks:
-        raise HTTPException(status_code=404, detail="No relevant context found.")
+    chunks = hybrid_search(body.query, top_k=6)
+    if not chunks:
+        raise HTTPException(404, "No relevant content found for that query.")
 
     history = "\n".join(
         f"User: {m['user']}\nAssistant: {m['assistant']}"
-        for m in CHAT_MEMORY[session_id][-5:]
+        for m in CHAT_MEMORY[sid][-5:]
     )
-
-    prompt = build_prompt(context_chunks, history, query)
+    prompt = build_prompt(chunks, history, body.query)
 
     return StreamingResponse(
-        stream_gemini_response(prompt, CHAT_MEMORY[session_id], query),
-        media_type="text/plain"
+        stream_response(prompt, CHAT_MEMORY[sid], body.query),
+        media_type="text/plain",
     )
