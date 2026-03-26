@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+langchain
+langchain-community
+langchain-core
+langchain-text-splitters
+pypdf
+faiss-cpu
+requests
+sentence-transformers
