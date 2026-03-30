@@ -6,7 +6,15 @@ langchain-text-splitters
 faiss-cpu
 python-multipart
 pypdf
-google-generativeai 
+google-genai
 pydantic
 rank_bm25
 numpy
+sqlalchemy>=2.0
+asyncmy>=0.2
+pydantic-settings>=2.0
+python-jose[cryptography]>=3.3
+httpx>=0.27
+pytest>=8.0
+pytest-asyncio>=0.23
+aiosqlite>=0.20
